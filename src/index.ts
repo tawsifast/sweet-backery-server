@@ -8,7 +8,7 @@ import { MongoClient, ObjectId, Db } from 'mongodb';
 export interface ICake {
   _id?: ObjectId;
   title: string;
-  shortDescription: string;
+  imageUrl: string; // 👈 shortDescription এর বদলে এটি যোগ করুন
   priceOrPriority: number | string;
   category: string;
   userId: string;
@@ -41,14 +41,19 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middlewares
-app.use(cors());
+// 🔗 1. CORS পলিসি ফিক্স (Next.js ফ্রন্টএন্ডের জন্য সেশন ও কুকি এলাও করা)
+app.use(cors({
+  origin: 'http://localhost:3000', // আপনার ফ্রন্টএন্ডের সুনির্দিষ্ট URL
+  credentials: true,               // সেশন কুকি ও অথরাইজেশন হেডার পাস করার অনুমতি
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'] // x-user-id হেডারটি এখানে এলাও করা হলো
+}));
+
 app.use(express.json());
 
 // MongoDB URI & Name
 const MONGO_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const DB_NAME = 'sweetbyte-ai';
-
 let db: Db;
 
 // ডাটাবেজ কানেকশন এবং সার্ভার স্টার্ট
@@ -124,17 +129,18 @@ app.get('/', (req: Request, res: Response) => {
  */
 app.post('/api/cakes', isAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
-    const { title, shortDescription, priceOrPriority, category, userId, fullDescription, tags } = req.body;
+    // 📷 shortDescription বাদ দিয়ে imageUrl রিসিভ করা হচ্ছে
+    const { title, imageUrl, priceOrPriority, category, userId, fullDescription, tags } = req.body;
 
-    // রিকোয়ার্ড ফিল্ড ভ্যালিডেশন
-    if (!title || !shortDescription || !priceOrPriority || !category || !userId) {
+    // রিকোয়ার্ড ফিল্ড ভ্যালিডেশন (imageUrl এখন আবশ্যক)
+    if (!title || !imageUrl || !priceOrPriority || !category || !userId) {
       return res.status(400).json({ error: 'Missing required fields to add a cake' });
     }
 
     // ইন্টারফেস মেনে নতুন অবজেক্ট তৈরি
     const newCake: ICake = {
       title,
-      shortDescription,
+      imageUrl, // 📷 নতুন প্রোপার্টি যুক্ত হলো
       priceOrPriority,
       category,
       userId,
@@ -205,7 +211,7 @@ app.get('/api/cakes/user/:userId', async (req: Request, res: Response): Promise<
  */
 app.get('/api/cakes/:id', async (req: Request, res: Response): Promise<any> => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid Cake ID format' });
@@ -228,7 +234,7 @@ app.get('/api/cakes/:id', async (req: Request, res: Response): Promise<any> => {
  */
 app.delete('/api/cakes/:id', isAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: 'Invalid Cake ID format' });
