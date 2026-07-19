@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, ObjectId, Db, Filter } from 'mongodb';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // ==================== TYPE INTERFACES ====================
 export interface ICake {
@@ -31,6 +32,11 @@ export interface IOrder {
   phoneNumber: string;
   status: 'Pending' | 'Processing' | 'Shipped' | 'Delivered' | 'Cancelled';
   createdAt: Date;
+}
+
+export interface AIGeneratedCakeDetails {
+  fullDescription: string;
+  tags: string[];
 }
 
 // ==================== CONFIGURATIONS ====================
@@ -526,5 +532,91 @@ app.get('/api/orders/:userId', verifyToken, async (req: Request, res: Response):
     return res.json(orders);
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+/**
+ * @route   POST /api/ai/generate-cake-details
+ * @desc    Gemini AI দিয়ে কেকের বিস্তারিত বর্ণনা ও ট্যাগ জেনারেট করা
+ */
+app.post('/api/ai/generate-cake-details', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { title, category } = req.body;
+
+    if (!title || !category) {
+      return res.status(400).json({ error: 'Missing required fields: title and category' });
+    }
+
+    if (typeof title !== 'string' || typeof category !== 'string') {
+      return res.status(400).json({ error: 'title and category must be strings' });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured' });
+    }
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-3.1-flash-lite',
+      systemInstruction: 'You are a professional pastry chef and bakery copywriter. Always respond with valid JSON only.'
+    });
+
+    const prompt = `Generate a professional cake description and tags for a cake with the following details:
+
+Title: "${title}"
+Category: "${category}"
+
+You MUST respond with ONLY valid JSON (no markdown, no code blocks, no extra text) in this exact format:
+{
+  "fullDescription": "A professional, engaging description (2-3 paragraphs) that describes the cake's likely flavors, appearance, texture, and ideal occasions. Never use placeholder or lorem ipsum text.",
+  "tags": ["tag1", "tag2", "tag3", "tag4"]
+}
+
+Requirements:
+- fullDescription must be unique, compelling, and specific to this cake title and category
+- fullDescription must NOT contain any placeholder or dummy text
+- tags array must contain exactly 4 relevant, searchable tags
+- Tags should be single words or short phrases (e.g. "chocolate", "birthday", "eggless")`;
+
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+
+    const cleaned = responseText.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
+
+    let parsed: AIGeneratedCakeDetails;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      return res.status(500).json({ error: 'AI returned invalid JSON', raw: responseText });
+    }
+
+    if (!parsed.fullDescription || typeof parsed.fullDescription !== 'string') {
+      return res.status(500).json({ error: 'AI response missing fullDescription' });
+    }
+
+    if (!Array.isArray(parsed.tags) || parsed.tags.length !== 4 || !parsed.tags.every(t => typeof t === 'string')) {
+      return res.status(500).json({ error: 'AI response must contain exactly 4 string tags' });
+    }
+
+    return res.json(parsed);
+  } catch (error: any) {
+    console.error('Gemini API Error:', error);
+
+    if (error?.status === 429 || error?.message?.includes('quota') || error?.message?.includes('RESOURCE_EXHAUSTED')) {
+      return res.status(429).json({
+        error: 'AI service quota exceeded. Please try again later or check your API billing.',
+      });
+    }
+
+    if (error?.status === 404 || error?.message?.includes('not found')) {
+      return res.status(500).json({
+        error: 'AI model unavailable. Please contact the administrator.',
+      });
+    }
+
+    return res.status(500).json({
+      error: error?.message || 'Failed to generate cake details',
+    });
   }
 });
