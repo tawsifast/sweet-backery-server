@@ -1,15 +1,14 @@
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { MongoClient, ObjectId, Db } from 'mongodb';
-import { createRemoteJWKSet, jwtVerify } from 'jose-cjs';
+import { MongoClient, ObjectId, Db, Filter } from 'mongodb';
 
 // ==================== TYPE INTERFACES ====================
 export interface ICake {
   _id?: ObjectId;
   title: string;
   imageUrl: string; 
-  priceOrPriority: number; // নিশ্চিত টাইপ সেফটি
+  priceOrPriority: number;
   category: string;
   userId: string;
   fullDescription: string;
@@ -44,7 +43,7 @@ app.use(cors({
   origin: 'http://localhost:3000', 
   credentials: true,               
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'] 
+  allowedHeaders: ['Content-Type', 'Authorization'] 
 }));
 
 app.use(express.json());
@@ -61,7 +60,6 @@ const getDB = (): Db => {
 };
 
 // ==================== AUTH MIDDLEWARES ====================
-const JWKS = createRemoteJWKSet(new URL(`${process.env.CLIENT_URL || 'http://localhost:3000'}/api/auth/jwks`));
 
 const verifyToken = async (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
@@ -74,29 +72,39 @@ const verifyToken = async (req: any, res: any, next: any) => {
   }
 
   try {
-    const { payload } = await jwtVerify(token, JWKS);
-    req.user = payload; // সেশন পে-লোড রিকোয়েস্টে পাস করা হলো
+    const currentDb = getDB();
+    const session = await currentDb.collection('session').findOne({ token, expiresAt: { $gt: new Date() } });
+    if (!session) {
+      return res.status(401).json({ message: "Unauthorized. Session not found or expired." });
+    }
+
+    const userId = session.userId instanceof ObjectId ? session.userId : new ObjectId(session.userId as string);
+    const user = await currentDb.collection('user').findOne({ _id: userId });
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized. User not found." });
+    }
+
+    req.user = {
+      id: user._id.toString(),
+      email: user.email,
+      role: user.role,
+    };
     next();
   } catch (error) {
     console.error("Token Verification Error:", error);
-    return res.status(401).json({ message: "Unauthorized. Token expired/invalid." });
+    return res.status(500).json({ message: "Authentication check failed." });
   }
 };
 
 const isAdmin = async (req: Request, res: Response, next: any): Promise<any> => {
   try {
-    const userId = req.headers['x-user-id']; 
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized. User session not found.' });
-    }
-
-    if (!ObjectId.isValid(userId as string)) {
-      return res.status(400).json({ error: 'Invalid User ID format in headers.' });
+    const email = (req as any).user?.email;
+    if (!email) {
+      return res.status(401).json({ error: 'Unauthorized. User not authenticated.' });
     }
 
     const currentDb = getDB();
-    const user = await currentDb.collection('user').findOne({ _id: new ObjectId(userId as string) });
+    const user = await currentDb.collection('user').findOne({ email });
 
     if (!user || user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden. Admin access required.' });
@@ -138,7 +146,7 @@ app.get('/', (req: Request, res: Response) => {
  * @route   POST /api/cakes
  * @desc    নতুন কেক আইটেম যোগ করা (শুধুমাত্র অ্যাডমিন)
  */
-app.post('/api/cakes', isAdmin, async (req: Request, res: Response): Promise<any> => {
+app.post('/api/cakes', verifyToken, isAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const { title, imageUrl, priceOrPriority, category, userId, fullDescription, tags } = req.body;
 
@@ -172,19 +180,33 @@ app.post('/api/cakes', isAdmin, async (req: Request, res: Response): Promise<any
  */
 app.get('/api/cakes', async (req: Request, res: Response): Promise<any> => {
   try {
-    const { search, category } = req.query;
-    let query: any = {};
+    const { search, category, page: pageParam, limit: limitParam } = req.query;
+    const query: Filter<ICake> = {};
 
-    if (search) query.title = { $regex: search, $options: 'i' };
-    if (category) query.category = category;
+    if (search && typeof search === 'string') {
+      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      query.title = { $regex: escaped, $options: 'i' };
+    }
+    if (category && typeof category === 'string') {
+      query.category = { $regex: `^${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' };
+    }
+
+    const page = Math.max(1, parseInt(pageParam as string) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(limitParam as string) || 10));
+    const skip = (page - 1) * limit;
 
     const currentDb = getDB();
-    const cakes = await currentDb.collection<ICake>('cakes')
-      .find(query)
-      .sort({ createdAt: -1 })
-      .toArray();
-      
-    return res.json(cakes);
+    const [total, cakes] = await Promise.all([
+      currentDb.collection<ICake>('cakes').countDocuments(query),
+      currentDb.collection<ICake>('cakes')
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+    ]);
+
+    return res.json({ total, cakes });
   } catch (error) {
     console.error('Error fetching cakes:', error);
     return res.status(500).json({ error: 'Failed to fetch cakes' });
@@ -212,7 +234,7 @@ app.get('/api/cakes/:id', async (req: Request, res: Response): Promise<any> => {
 /**
  * @route   DELETE /api/cakes/:id
  */
-app.delete('/api/cakes/:id', isAdmin, async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/cakes/:id', verifyToken, isAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const id = req.params.id as string;
     if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid Cake ID format' });
@@ -230,7 +252,7 @@ app.delete('/api/cakes/:id', isAdmin, async (req: Request, res: Response): Promi
 /**
  * @route   POST /api/orders
  */
-app.post('/api/orders', async (req: Request, res: Response): Promise<any> => {
+app.post('/api/orders', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId, items, deliveryAddress, phoneNumber } = req.body;
 
@@ -260,7 +282,7 @@ app.post('/api/orders', async (req: Request, res: Response): Promise<any> => {
 /**
  * @route   POST /api/cart
  */
-app.post('/api/cart', async (req: Request, res: Response): Promise<any> => {
+app.post('/api/cart', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId, cakeId, quantity } = req.body;
     if (!userId || !cakeId) return res.status(400).json({ error: 'Missing userId or cakeId' });
@@ -285,7 +307,7 @@ app.post('/api/cart', async (req: Request, res: Response): Promise<any> => {
 /**
  * @route   POST /api/wishlist/toggle
  */
-app.post('/api/wishlist/toggle', async (req: Request, res: Response): Promise<any> => {
+app.post('/api/wishlist/toggle', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId, cakeId } = req.body;
     if (!userId || !cakeId) return res.status(400).json({ error: 'Missing userId or cakeId' });
@@ -307,9 +329,49 @@ app.post('/api/wishlist/toggle', async (req: Request, res: Response): Promise<an
 });
 
 /**
+ * @route   GET /api/wishlist/:userId
+ */
+app.get('/api/wishlist/:userId', verifyToken, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { userId } = req.params;
+    const currentDb = getDB();
+
+    const items = await currentDb.collection('wishlist').aggregate([
+      { $match: { userId } },
+      {
+        $lookup: {
+          from: 'cakes',
+          let: { cakeIdStr: '$cakeId' },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$cakeIdStr'] } } }
+          ],
+          as: 'cake'
+        }
+      },
+      { $unwind: { path: '$cake', preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 1,
+          cakeId: 1,
+          savedAt: 1,
+          title: '$cake.title',
+          priceOrPriority: '$cake.priceOrPriority',
+          imageUrl: '$cake.imageUrl'
+        }
+      },
+      { $sort: { savedAt: -1 } }
+    ]).toArray();
+
+    return res.json(items);
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch wishlist items' });
+  }
+});
+
+/**
  * @route   GET /api/cart/:userId
  */
-app.get('/api/cart/:userId', async (req: Request, res: Response): Promise<any> => {
+app.get('/api/cart/:userId', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId } = req.params;
     const currentDb = getDB();
@@ -350,7 +412,7 @@ app.get('/api/cart/:userId', async (req: Request, res: Response): Promise<any> =
 /**
  * @route   DELETE /api/cart/clear/:userId
  */
-app.delete('/api/cart/clear/:userId', async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/cart/clear/:userId', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId } = req.params;
     const currentDb = getDB();
@@ -364,7 +426,7 @@ app.delete('/api/cart/clear/:userId', async (req: Request, res: Response): Promi
 /**
  * @route   DELETE /api/cart/:userId/:cakeId
  */
-app.delete('/api/cart/:userId/:cakeId', async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/cart/:userId/:cakeId', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId, cakeId } = req.params;
     const currentDb = getDB();
@@ -380,7 +442,7 @@ app.delete('/api/cart/:userId/:cakeId', async (req: Request, res: Response): Pro
  * @route   GET /api/cart/count/:userId
  * @desc    ইউজারের কার্টের মোট আইটেম সংখ্যা
  */
-app.get('/api/cart/count/:userId', async (req: Request, res: Response): Promise<any> => {
+app.get('/api/cart/count/:userId', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId } = req.params;
     const currentDb = getDB();
@@ -397,7 +459,7 @@ app.get('/api/cart/count/:userId', async (req: Request, res: Response): Promise<
  * @route   GET /api/admin/orders
  * @desc    সব গ্রাহকের অর্ডার হিস্টোরি দেখা (শুধুমাত্র অ্যাডমিন)
  */
-app.get('/api/admin/orders', isAdmin, async (req: Request, res: Response): Promise<any> => {
+app.get('/api/admin/orders', verifyToken, isAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const currentDb = getDB();
     const orders = await currentDb.collection<IOrder>('orders')
@@ -415,7 +477,7 @@ app.get('/api/admin/orders', isAdmin, async (req: Request, res: Response): Promi
  * @route   PATCH /api/admin/orders/:orderId/status
  * @desc    অর্ডারের স্ট্যাটাস মডিফাই করা (FIXED for MongoDB v6+)
  */
-app.patch('/api/admin/orders/:orderId/status', isAdmin, async (req: Request, res: Response): Promise<any> => {
+app.patch('/api/admin/orders/:orderId/status', verifyToken, isAdmin, async (req: Request, res: Response): Promise<any> => {
   try {
     const { orderId } = req.params;
     const { status } = req.body;
@@ -453,7 +515,7 @@ app.patch('/api/admin/orders/:orderId/status', isAdmin, async (req: Request, res
  * @route   GET /api/orders/:userId
  * @desc    নির্দিষ্ট কাস্টমারের অর্ডার হিস্টোরি
  */
-app.get('/api/orders/:userId', async (req: Request, res: Response): Promise<any> => {
+app.get('/api/orders/:userId', verifyToken, async (req: Request, res: Response): Promise<any> => {
   try {
     const { userId } = req.params;
     const currentDb = getDB();
