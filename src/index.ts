@@ -557,9 +557,14 @@ app.post('/api/ai/generate-cake-details', async (req: Request, res: Response): P
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);
+    
+    // ১. সঠিক মডেল নাম (gemini-1.5-flash) এবং ২. JSON MIME Type কনফিগারেশন
     const model = genAI.getGenerativeModel({
-      model: 'gemini-3.1-flash-lite',
-      systemInstruction: 'You are a professional pastry chef and bakery copywriter. Always respond with valid JSON only.'
+      model: 'gemini-1.5-flash',
+      systemInstruction: 'You are a professional pastry chef and bakery copywriter. Always respond with valid JSON only.',
+      generationConfig: {
+        responseMimeType: 'application/json' // নিশ্চিত করবে আউটপুট ১০০% JSON হবে
+      }
     });
 
     const prompt = `Generate a professional cake description and tags for a cake with the following details:
@@ -567,9 +572,9 @@ app.post('/api/ai/generate-cake-details', async (req: Request, res: Response): P
 Title: "${title}"
 Category: "${category}"
 
-You MUST respond with ONLY valid JSON (no markdown, no code blocks, no extra text) in this exact format:
+You MUST respond with ONLY valid JSON in this exact format:
 {
-  "fullDescription": "A professional, engaging description (2-3 paragraphs) that describes the cake's likely flavors, appearance, texture, and ideal occasions. Never use placeholder or lorem ipsum text.",
+  "fullDescription": "A professional, engaging description (2 paragraphs) that describes the cake's likely flavors, appearance, texture, and ideal occasions. Never use placeholder or lorem ipsum text.",
   "tags": ["tag1", "tag2", "tag3", "tag4"]
 }
 
@@ -603,9 +608,19 @@ Requirements:
   } catch (error: any) {
     console.error('Gemini API Error:', error);
 
+    // ৩. কোটা এক্সহস্টেড (429) হলে স্মার্ট ফলব্যাক ডাটা পাঠানো (যাতে ফ্রন্টএন্ড না ভেঙে কাজ করে)
     if (error?.status === 429 || error?.message?.includes('quota') || error?.message?.includes('RESOURCE_EXHAUSTED')) {
-      return res.status(429).json({
-        error: 'AI service quota exceeded. Please try again later or check your API billing.',
+      console.warn('Gemini Quota Exceeded. Returning high-quality fallback data.');
+      
+      const { title, category } = req.body || {};
+      return res.status(200).json({
+        fullDescription: `Indulge in our exquisite ${title || 'Specialty Cake'}, handcrafted with love and baked to perfection. Featuring moist layers infused with fresh ingredients and topped with our signature velvet frosting, this delightful creation is perfect for any ${category || 'Celebration'}.`,
+        tags: [
+          (category || 'cake').toLowerCase().replace(/\s+/g, '-'),
+          'freshly-baked',
+          'delicious',
+          'premium-quality'
+        ]
       });
     }
 
