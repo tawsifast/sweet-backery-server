@@ -1,14 +1,13 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, ObjectId, Db, Filter } from 'mongodb';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // ==================== TYPE INTERFACES ====================
 export interface ICake {
   _id?: ObjectId;
   title: string;
-  imageUrl: string; 
+  imageUrl: string;
   priceOrPriority: number;
   category: string;
   userId: string;
@@ -46,17 +45,46 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors({
-  origin: 'http://localhost:3000', 
-  credentials: true,               
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:5173', // Vite/React এর জন্য (যদি ব্যবহার করেন)
+    process.env.CLIENT_URL || '' // ডেপ্লয় করা লাইভ ফ্রন্টএন্ড URL
+  ],
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'] 
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 
 const MONGO_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const DB_NAME = 'sweetbyte-ai';
+
+// ==================== DATABASE CONNECTION (race-condition safe) ====================
 let db: Db;
+let dbConnectionPromise: Promise<Db> | null = null;
+
+const connectDB = (): Promise<Db> => {
+  if (db) return Promise.resolve(db);
+
+  if (!dbConnectionPromise) {
+    const client = new MongoClient(MONGO_URI);
+    dbConnectionPromise = client
+      .connect()
+      .then(() => {
+        db = client.db(DB_NAME);
+        console.log('🔥 MongoDB Connected Successfully!');
+        return db;
+      })
+      .catch((err) => {
+        console.error('❌ MongoDB Connection Error:', err);
+        dbConnectionPromise = null; // পরের রিকোয়েস্টে আবার ট্রাই করার সুযোগ
+        throw err;
+      });
+  }
+
+  return dbConnectionPromise;
+};
 
 const getDB = (): Db => {
   if (!db) {
@@ -64,6 +92,17 @@ const getDB = (): Db => {
   }
   return db;
 };
+
+// প্রতিটা রিকোয়েস্টের আগে DB কানেকশন নিশ্চিত করে (cold start-এ ব্লক করে,
+// warm instance-এ instant resolve হয়ে যায়)
+app.use(async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    res.status(503).json({ error: 'Database connection failed' });
+  }
+});
 
 // ==================== AUTH MIDDLEWARES ====================
 
@@ -116,31 +155,12 @@ const isAdmin = async (req: Request, res: Response, next: any): Promise<any> => 
       return res.status(403).json({ error: 'Forbidden. Admin access required.' });
     }
 
-    next(); 
+    next();
   } catch (error) {
     console.error('Authorization Middleware Error:', error);
     return res.status(500).json({ error: 'Authorization check failed.' });
   }
 };
-
-// ==================== SERVER INITIALIZATION ====================
-async function startServer() {
-  try {
-    const client = new MongoClient(MONGO_URI);
-    await client.connect();
-    db = client.db(DB_NAME);
-    console.log('🔥 Native MongoDB Connected Successfully!');
-    
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on http://localhost:${PORT}`);
-    });
-  } catch (err) {
-    console.error('❌ MongoDB Connection Error:', err);
-    process.exit(1);
-  }
-}
-
-startServer();
 
 // ==================== API ROUTES ====================
 
@@ -162,7 +182,7 @@ app.post('/api/cakes', verifyToken, isAdmin, async (req: Request, res: Response)
 
     const newCake: ICake = {
       title,
-      imageUrl, 
+      imageUrl,
       priceOrPriority: Number(priceOrPriority), // টাইপ ফোর্স টু নাম্বার
       category,
       userId,
@@ -173,7 +193,7 @@ app.post('/api/cakes', verifyToken, isAdmin, async (req: Request, res: Response)
 
     const currentDb = getDB();
     const result = await currentDb.collection<ICake>('cakes').insertOne(newCake);
-    
+
     return res.status(201).json({ _id: result.insertedId, ...newCake });
   } catch (error) {
     console.error('Error inserting cake:', error);
@@ -230,7 +250,7 @@ app.get('/api/cakes/:id', async (req: Request, res: Response): Promise<any> => {
     const currentDb = getDB();
     const cake = await currentDb.collection<ICake>('cakes').findOne({ _id: new ObjectId(id) });
     if (!cake) return res.status(404).json({ error: 'Cake not found' });
-    
+
     return res.json(cake);
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch cake details' });
@@ -498,13 +518,13 @@ app.patch('/api/admin/orders/:orderId/status', verifyToken, isAdmin, async (req:
     }
 
     const currentDb = getDB();
-    
-    // টাইপ সেফটি নিশ্চিত করতে এবং টাইপস্ক্রিপ্ট এরর এড়াতে টাইপ কাস্টিং করা হয়েছে
+
+    // টাইপ সেফটি নিশ্চিত করতে এবং টাইপস্ক্রিপ্ট এরর এড়াতে টাইপ কাস্টিং করা হয়েছে
     const updatedOrder = await currentDb.collection('orders').findOneAndUpdate(
       { _id: new ObjectId(orderId as string) },
       { $set: { status: status as IOrder['status'] } },
       { returnDocument: 'after' }
-    ) as IOrder | null; // এখানে টাইপ কাস্ট করে দেওয়া হলো
+    ) as IOrder | null; // এখানে টাইপ কাস্ট করে দেওয়া হলো
 
     if (!updatedOrder) {
       return res.status(404).json({ error: 'Order not found to update' });
@@ -541,7 +561,7 @@ app.get('/api/orders/:userId', verifyToken, async (req: Request, res: Response):
  */
 app.post('/api/ai/generate-cake-details', async (req: Request, res: Response): Promise<any> => {
   try {
-    const { title, category } = req.body;
+    const { title, category, length: outputLength } = req.body;
 
     if (!title || !category) {
       return res.status(400).json({ error: 'Missing required fields: title and category' });
@@ -551,30 +571,33 @@ app.post('/api/ai/generate-cake-details', async (req: Request, res: Response): P
       return res.status(400).json({ error: 'title and category must be strings' });
     }
 
+    const validLengths = ['short', 'medium', 'long'] as const;
+    const length = validLengths.includes(outputLength) ? outputLength : 'medium';
+
+    const lengthInstructions: Record<string, string> = {
+      short: 'Write a concise 1-paragraph description (2-3 sentences).',
+      medium: 'Write a detailed 2-paragraph description.',
+      long: 'Write an extensive 3-4 paragraph description with rich detail about flavors, texture, appearance, pairings, and ideal occasions.',
+    };
+
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return res.status(500).json({ error: 'GEMINI_API_KEY is not configured' });
     }
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    
-    // ১. সঠিক মডেল নাম (gemini-1.5-flash) এবং ২. JSON MIME Type কনফিগারেশন
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
-      systemInstruction: 'You are a professional pastry chef and bakery copywriter. Always respond with valid JSON only.',
-      generationConfig: {
-        responseMimeType: 'application/json' // নিশ্চিত করবে আউটপুট ১০০% JSON হবে
-      }
-    });
+    const prompt = `You are a professional pastry chef and bakery copywriter. Always respond with valid JSON only.
 
-    const prompt = `Generate a professional cake description and tags for a cake with the following details:
+Generate a professional cake description and tags for a cake with the following details:
 
 Title: "${title}"
 Category: "${category}"
+Output Length: ${length}
+
+${lengthInstructions[length]}
 
 You MUST respond with ONLY valid JSON in this exact format:
 {
-  "fullDescription": "A professional, engaging description (2 paragraphs) that describes the cake's likely flavors, appearance, texture, and ideal occasions. Never use placeholder or lorem ipsum text.",
+  "fullDescription": "A professional, engaging description that describes the cake's likely flavors, appearance, texture, and ideal occasions. Never use placeholder or lorem ipsum text.",
   "tags": ["tag1", "tag2", "tag3", "tag4"]
 }
 
@@ -584,8 +607,60 @@ Requirements:
 - tags array must contain exactly 4 relevant, searchable tags
 - Tags should be single words or short phrases (e.g. "chocolate", "birthday", "eggless")`;
 
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
+    const fallback = () => ({
+      fullDescription: `Indulge in our exquisite ${title || 'Specialty Cake'}, handcrafted with love and baked to perfection. Featuring moist layers infused with fresh ingredients and topped with our signature velvet frosting, this delightful creation is perfect for any ${category || 'Celebration'}.`,
+      tags: [
+        (category || 'cake').toLowerCase().replace(/\s+/g, '-'),
+        'freshly-baked',
+        'delicious',
+        'premium-quality'
+      ]
+    });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    let geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    });
+    clearTimeout(timeout);
+
+    if (geminiRes.status === 503) {
+      console.warn('Gemini 503 (high demand). Retrying once after 1s...');
+      await new Promise(r => setTimeout(r, 1000));
+      const retryController = new AbortController();
+      const retryTimeout = setTimeout(() => retryController.abort(), 15000);
+      geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: retryController.signal,
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
+      clearTimeout(retryTimeout);
+    }
+
+    if (!geminiRes.ok) {
+      const rawErr = await geminiRes.text();
+      console.error(`❌ Gemini generate error [${geminiRes.status}]:`, rawErr.slice(0, 500));
+      const status = geminiRes.status;
+
+      if (status === 400 || status === 403 || status === 404) {
+        return res.status(500).json({ error: 'AI service configuration issue. Please contact the administrator.' });
+      }
+
+      if (status === 429 || status === 503) {
+        console.warn('Gemini rate-limited or unavailable. Returning fallback data.');
+        return res.status(200).json(fallback());
+      }
+
+      return res.status(500).json({ error: rawErr || 'Failed to generate cake details' });
+    }
+
+    const geminiData: any = await geminiRes.json();
+    const responseText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
     const cleaned = responseText.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
 
@@ -606,32 +681,339 @@ Requirements:
 
     return res.json(parsed);
   } catch (error: any) {
-    console.error('Gemini API Error:', error);
-
-    // ৩. কোটা এক্সহস্টেড (429) হলে স্মার্ট ফলব্যাক ডাটা পাঠানো (যাতে ফ্রন্টএন্ড না ভেঙে কাজ করে)
-    if (error?.status === 429 || error?.message?.includes('quota') || error?.message?.includes('RESOURCE_EXHAUSTED')) {
-      console.warn('Gemini Quota Exceeded. Returning high-quality fallback data.');
-      
-      const { title, category } = req.body || {};
-      return res.status(200).json({
-        fullDescription: `Indulge in our exquisite ${title || 'Specialty Cake'}, handcrafted with love and baked to perfection. Featuring moist layers infused with fresh ingredients and topped with our signature velvet frosting, this delightful creation is perfect for any ${category || 'Celebration'}.`,
-        tags: [
-          (category || 'cake').toLowerCase().replace(/\s+/g, '-'),
-          'freshly-baked',
-          'delicious',
-          'premium-quality'
-        ]
-      });
-    }
-
-    if (error?.status === 404 || error?.message?.includes('not found')) {
-      return res.status(500).json({
-        error: 'AI model unavailable. Please contact the administrator.',
-      });
-    }
-
+    console.error('Gemini API Error:', JSON.stringify({ message: error?.message, stack: error?.stack?.split('\n')[0] }));
     return res.status(500).json({
       error: error?.message || 'Failed to generate cake details',
     });
   }
 });
+
+/**
+ * @route   POST /api/ai/chat
+ * @desc    AI Chat Assistant — conversational bakery assistant with context
+ */
+app.post('/api/ai/chat', async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { messages, userId } = req.body;
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured' });
+    }
+
+    // Fetch expanded project context from the database
+    let bakeryContext = 'No menu data available.';
+    let categoriesList: string[] = [];
+    let userInfo = '';
+    let userOrders = '';
+    let userCart = '';
+    let userWishlist = '';
+
+    try {
+      const currentDb = getDB();
+
+      const cakes = await currentDb.collection('cakes')
+        .find({}, { projection: { title: 1, category: 1, priceOrPriority: 1, tags: 1 } })
+        .limit(20)
+        .toArray();
+      if (cakes.length > 0) {
+        bakeryContext = cakes.map(c =>
+          `- ${c.title} ($${c.priceOrPriority}) [${c.category}]`
+        ).join('\n');
+      }
+
+      const categories = await currentDb.collection('cakes').distinct('category');
+      categoriesList = categories.filter(Boolean) as string[];
+
+      if (userId) {
+        const user = await currentDb.collection('user').findOne(
+          { _id: new ObjectId(userId) },
+          { projection: { name: 1, email: 1, role: 1 } }
+        );
+        if (user) {
+          userInfo = `Name: ${user.name}, Email: ${user.email}, Role: ${user.role}`;
+        }
+
+        const orders = await currentDb.collection('orders')
+          .find({ userId })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .toArray();
+        if (orders.length > 0) {
+          userOrders = orders.map((o: any) =>
+            `Order #${o._id}: ${o.items?.length || 0} items, Status: ${o.status}`
+          ).join('\n');
+        }
+
+        const cartCount = await currentDb.collection('cart').countDocuments({ userId });
+        userCart = cartCount > 0 ? `${cartCount} items in cart` : 'Cart is empty';
+
+        const wishlistCount = await currentDb.collection('wishlist').countDocuments({ userId });
+        userWishlist = wishlistCount > 0 ? `${wishlistCount} saved items` : 'No saved items';
+      }
+    } catch { /* no-op — use fallback context */ }
+
+    // Build conversation history and find latest question
+    const conversationText = messages.map((m: any) => {
+      const label = m.role === 'assistant' ? 'Assistant' : 'Customer';
+      return `${label}: ${m.content}`;
+    }).join('\n');
+
+    const lastUserMsg = [...messages].reverse().find((m: any) => m.role === 'user');
+    const latestQuestion = lastUserMsg?.content || '';
+    const allUserText = messages.filter((m: any) => m.role === 'user').map((m: any) => m.content.toLowerCase()).join(' ');
+
+    // Smart fallback with expanded project context
+    const chatFallback = (): { reply: string; suggestions: string[] } => {
+      const q = latestQuestion.toLowerCase();
+      const allQ = allUserText;
+      const categories = categoriesList.length > 0 ? categoriesList.join(', ') : 'Cakes, Cupcakes, Pastries';
+
+      if (userId && (q.includes('my') || q.includes('me') || q.includes('i '))) {
+        if (q.includes('order') || allQ.includes('order')) {
+          return {
+            reply: userOrders
+              ? `Here are your recent orders:\n${userOrders}\n\nYou can view full details in your Dashboard.`
+              : "You don't have any orders yet. Browse our Products page to place your first order!",
+            suggestions: ["How do I place an order?", "What's on your menu?", "Show me best-sellers"]
+          };
+        }
+        if (q.includes('cart')) {
+          return {
+            reply: `You have ${userCart}. Visit your Dashboard to manage your cart and checkout!`,
+            suggestions: ["What's in my cart?", "How do I checkout?", "Show me products"]
+          };
+        }
+        if (q.includes('wishlist') || q.includes('saved') || q.includes('favorite')) {
+          return {
+            reply: `You have ${userWishlist}. You can manage your wishlist from the product pages!`,
+            suggestions: ["Browse products", "What's popular?", "Add to cart"]
+          };
+        }
+        if (q.includes('account') || q.includes('profile') || q.includes('info')) {
+          return {
+            reply: userInfo ? `Here's your account info:\n${userInfo}` : "Please log in to view your account details.",
+            suggestions: ["My orders", "My cart", "Browse products"]
+          };
+        }
+        if (q.includes('dashboard') || q.includes('panel') || q.includes('admin')) {
+          return {
+            reply: "You can access your Dashboard from the navigation bar. There you can manage orders, your cart, and account settings.",
+            suggestions: ["My orders", "My cart", "Account settings"]
+          };
+        }
+      }
+
+      if (q.includes('cake') || q.includes('menu') || q.includes('browse') || q.includes('have') || q.includes('product') || q.includes('offer') || q.includes('sell')) {
+        return {
+          reply: bakeryContext.startsWith('-')
+            ? `Here's what we have right now:\n${bakeryContext.split('\n').slice(0, 6).join('\n')}\n\nWe also have ${categories}. What would you like to know more about?`
+            : `We offer a wonderful selection including ${categories}. What sounds interesting to you?`,
+          suggestions: ["Tell me about your cakes", "What's the price range?", "Do you have custom orders?"]
+        };
+      }
+
+      if (q.includes('price') || q.includes('cost') || q.includes('much') || q.includes('expensive') || q.includes('cheap') || q.includes('budget') || q.includes('afford') || q.includes('spend')) {
+        return {
+          reply: "Our prices vary by item — most Celebration Cakes range from $25-$60, Cupcakes start at $3 each, Cookies at $2, and Artisan Breads start at $6. Visit our Products page to see the full menu with prices!",
+          suggestions: ["What's your most popular cake?", "Do you have any deals?", "Can I customize a cake?"]
+        };
+      }
+
+      if (q.includes('order') || q.includes('delivery') || q.includes('shipp') || q.includes('deliver') || q.includes('buy') || q.includes('purchase') || q.includes('checkout') || q.includes('pay') || q.includes('place')) {
+        return {
+          reply: userId
+            ? `To place an order, browse our Products, add items to your cart, and checkout. ${userOrders ? `\n\nYou currently have orders: ${userOrders.split('\n').length} order(s).` : ''}`
+            : "Please sign in first to place orders! Once logged in, browse our Products page, add items to cart, and proceed to checkout.",
+          suggestions: ["How do I track my order?", "What's your return policy?", "Do you offer local pickup?"]
+        };
+      }
+
+      if (q.includes('recommend') || q.includes('suggest') || q.includes('popular') || q.includes('best') || q.includes('favorite') || q.includes('top') || q.includes('bestseller') || q.includes('trend')) {
+        return {
+          reply: "Our Celebration Cakes are customer favorites — perfect for birthdays and special occasions! The Velvet Rose Gateau and Chocolate Dream Cake are top sellers. For something lighter, our Croissants and Cupcakes are always a hit!",
+          suggestions: ["What cake is good for a birthday?", "Do you have eggless options?", "What's new this season?"]
+        };
+      }
+
+      if (q.includes('birthday') || q.includes('anniversary') || q.includes('wedding') || q.includes('event') || q.includes('party') || q.includes('celebration') || q.includes('occasion')) {
+        return {
+          reply: "Our Celebration Cakes category is perfect for any occasion! Beautifully decorated cakes for birthdays, anniversaries, and weddings. Check our Seasonal Specials too. Each cake can be customized!",
+          suggestions: ["Can I customize the design?", "How far in advance should I order?", "Do you have cake tasting?"]
+        };
+      }
+
+      if (q.includes('ingredient') || q.includes('vegan') || q.includes('gluten') || q.includes('allerg') || q.includes('eggless') || q.includes('dairy') || q.includes('nut') || q.includes('diet') || q.includes('healthy')) {
+        return {
+          reply: "We take dietary needs seriously! Many items can be made eggless or with alternative ingredients. Check product descriptions or contact us for custom dietary requirements.",
+          suggestions: ["Do you have gluten-free options?", "Are your cakes nut-free?", "What vegan options do you have?"]
+        };
+      }
+
+      if (q.includes('contact') || q.includes('phone') || q.includes('email') || q.includes('call') || q.includes('reach') || q.includes('support') || q.includes('help') || q.includes('location') || q.includes('address') || q.includes('open') || q.includes('hour') || q.includes('store')) {
+        return {
+          reply: "You can reach us through our Contact page, or visit your Dashboard to manage orders and account settings. We're always here to help!",
+          suggestions: ["I have a question about my order", "Where are you located?", "Can I speak to a person?"]
+        };
+      }
+
+      if (q.includes('hello') || q.includes('hi ') || q.includes('hey') || q.includes('good morning') || q.includes('good evening') || q.includes('greeting') || q.includes('howdy') || q.includes('yo') || q.includes('whatsup') || q.includes('sup')) {
+        return {
+          reply: `Hey there! Welcome to SweetByte Bakery! 🧁 I'm your bakery assistant.${userId ? ` Great to see you again!` : ''} Looking for a delicious cake or a sweet treat? Let me know how I can help!`,
+          suggestions: ["What cakes do you have?", "I need help choosing", "Show me your best-sellers"]
+        };
+      }
+
+      if (q.includes('chocolate') || q.includes('vanilla') || q.includes('strawberry') || q.includes('red velvet') || q.includes('caramel') || q.includes('coffee') || q.includes('fruit') || q.includes('berry') || q.includes('cream') || q.includes('cheesecake') || q.includes('flavor')) {
+        return {
+          reply: "Great flavor choices! We have a variety of cakes in chocolate, vanilla, red velvet, and fruit flavors. Check our Products page to see the full selection with descriptions!",
+          suggestions: ["What chocolate options do you have?", "Do you have fruit cakes?", "Can I mix flavors?"]
+        };
+      }
+
+      return {
+        reply: `Thanks for reaching out to SweetByte Bakery! We have a wonderful selection of ${categories}. What would you like to know more about?`,
+        suggestions: ["What cakes do you recommend?", "Tell me about your menu", "How do I place an order?"]
+      };
+    };
+
+    const prompt = `You are a friendly and knowledgeable bakery assistant for "SweetByte Bakery". You help customers with questions about cakes, bakery items, orders, and bakery-related topics.
+
+Here is our current menu:
+${bakeryContext}
+
+Available categories: ${categoriesList.join(', ') || 'Cakes, Cupcakes, Pastries, Cookies'}
+
+${userId ? `Customer info:\n${userInfo || 'Logged in'}\nOrders:\n${userOrders || 'No orders yet'}\nCart: ${userCart}\nWishlist: ${userWishlist}` : 'Customer is not logged in.'}
+
+Guidelines:
+- Answer questions based on our menu. If something is not on the menu, suggest the closest alternative.
+- Keep responses warm, enthusiastic, and concise (2-4 sentences).
+- If asked about order status, delivery, or account issues, check the customer info above. If they have orders, answer based on that data.
+- If you don't know something, say so honestly.
+
+Conversation so far:
+${conversationText}
+
+Now respond to the customer's latest question. Keep it warm and helpful. Then on a new line, suggest 3 short follow-up questions the customer might ask next, each on its own line starting with "Q:".`;
+
+    // Use the same proven single-content format as generate-cake-details
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+
+    let geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      }
+    );
+    clearTimeout(timeout);
+
+    // Retry once on 503 (same as generate-cake-details)
+    if (geminiRes.status === 503) {
+      console.warn('Gemini chat 503. Retrying once after 1s...');
+      await new Promise(r => setTimeout(r, 1000));
+      const retryController = new AbortController();
+      const retryTimeout = setTimeout(() => retryController.abort(), 20000);
+      geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: retryController.signal,
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        }
+      );
+      clearTimeout(retryTimeout);
+    }
+
+    if (!geminiRes.ok) {
+      const rawErr = await geminiRes.text();
+      const status = geminiRes.status;
+      console.error(`❌ Gemini chat error [${status}]:`, rawErr.slice(0, 500));
+
+      if (status === 400 || status === 403 || status === 404) {
+        return res.status(200).json({
+          reply: "Our AI assistant is temporarily unavailable. Please try again later!",
+          suggestions: ["Browse our products", "Check our menu", "Contact us directly"]
+        });
+      }
+
+      if (status === 429 || status === 503) {
+        console.warn('Gemini quota exceeded. Returning smart fallback.');
+        return res.status(200).json(chatFallback());
+      }
+
+      return res.status(500).json({ error: rawErr || 'Failed to get AI response' });
+    }
+
+    const geminiData: any = await geminiRes.json();
+    const responseText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    if (!responseText) {
+      return res.status(200).json({
+        reply: "I'm sorry, I couldn't process that. Could you rephrase your question?",
+        suggestions: ["Show me your cake menu", "What's popular today?", "I need help choosing a cake"]
+      });
+    }
+
+    // Parse the reply and suggestions from the response
+    // Format expected: reply text followed by lines starting with "Q:"
+    const lines = responseText.split('\n').map((l: string) => l.trim()).filter(Boolean);
+    const qLines: string[] = [];
+    const replyLines: string[] = [];
+
+    for (const line of lines) {
+      if (line.startsWith('Q:') || line.startsWith('q:')) {
+        qLines.push(line.replace(/^Q:\s*/i, ''));
+      } else {
+        replyLines.push(line);
+      }
+    }
+
+    const reply = replyLines.join('\n');
+    const suggestions = qLines.length >= 2
+      ? qLines.slice(0, 3)
+      : [
+          "What cakes do you recommend?",
+          "Tell me about your best-sellers",
+          "Can you suggest a cake for a birthday?"
+        ];
+
+    return res.json({ reply, suggestions });
+  } catch (error: any) {
+    console.error('AI Chat Error:', error?.message);
+    return res.status(500).json({
+      reply: "Sorry, I'm having trouble connecting right now. Please try again.",
+      suggestions: ["What cakes do you have?", "How do I place an order?", "Contact support"]
+    });
+  }
+});
+
+// ==================== SERVER STARTUP ====================
+
+if (process.env.NODE_ENV !== 'production') {
+  // লোকাল dev: DB connect হওয়ার পর সার্ভার listen করান
+  connectDB()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`🚀 Server running on http://localhost:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error('❌ Failed to start server:', err);
+      process.exit(1);
+    });
+}
+// production (Vercel serverless)-এ আলাদা করে listen/connect কল করার দরকার নেই —
+// উপরের app.use middleware প্রতিটা রিকোয়েস্টে connectDB() কল করে,
+// এবং একই warm instance-এ পরের রিকোয়েস্টগুলোর জন্য এটা cached থাকে।
+
+export default app;
